@@ -1,0 +1,703 @@
+---
+title: "PI curves"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+library(piCurve)
+library(ggplot2)
+library(dplyr)
+library(maps)
+library(grid)
+```
+
+### example dataset and plot
+``` {r}
+# test code# Split the data
+grouped <- 
+    piDataSet |> 
+    dplyr::group_by(pi_number) |> 
+    dplyr::group_split()
+
+# Extract pi_number values
+pi_numbers <- 
+    piDataSet |> 
+    dplyr::group_by(pi_number) |> 
+    dplyr::group_keys() |> 
+    dplyr::pull(pi_number)
+
+# Apply function and combine with pi_number
+result_df <- data.frame(
+    pi_number = pi_numbers,
+    data_type = unlist(parallel::mclapply(grouped, function(x) DataType_piCurve(data = x, n_cores = 1)$data_type, mc.cores = 6))
+)
+dplyr::count(result_df, data_type)
+```
+
+```{r}
+df <- grouped[[5]]
+
+# fit model on a given data
+fit <- Fit_piModel(data = df, STATapp = "MLE", Hessian = TRUE)
+
+print(fit)
+```
+
+``` {r}
+p <- # plot the fitted model 
+    Plot_piCurve(fit, df, length_out = 200, add_CI = TRUE, n_cores = 6)
+
+p + # increase the size of axis title and font
+    theme(axis.text = element_text(size = 14), axis.title = element_text(size = 14))
+```
+
+```{r}
+seaflow_pi <- read.csv("../data/clean_growth_1H.csv")
+# subset(seaflow_pi, select = c(cruise, cruise_day, hour, par_smooth, slope))
+
+seaflow_pi <- seaflow_pi %>% rename(
+  P = slope,
+  I = par_smooth
+)
+
+# try fitting model to 1 day on a cruise
+dielcruise_test <- subset(seaflow_pi, cruise == 'KM1513' & cruise_day == 3 & pop == 'prochloro' & hour <= 8)
+### exclude days where growth rate does not saturate (light limited), only include hours up to peak PAR + maybe 1-2 hours
+# need to exclude variability coming from cell cycle
+## also try making PI curves with daily PP and total or average light
+# lm(formula = I ~ P, data = seaflow_pi)
+
+fit <- Fit_piModel(data = dielcruise_test, Hessian = TRUE)
+print(fit)
+
+p <- # plot the fitted model
+    Plot_piCurve(fit, dielcruise_test, length_out = 200, add_CI = TRUE, n_cores = 6)
+
+p + # increase the size of axis title and font
+    theme(axis.text = element_text(size = 14), axis.title = element_text(size = 14))
+```
+
+
+
+New Model from Mohammad
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(piCurve)
+library(parallel)
+library(lubridate)
+library(glue)
+
+rm(list = ls())
+## original cleaned data from M
+og_path <-  "/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/pe_curves/mohammad/data/cleaned-data/testData/pro_hourly_growth_par-cleaned-MA-Aug6-2026.csv"
+# new data I generated 
+time_res_tests <- c('15min', '30min', '1H')
+
+# Initialize lists to save one data frame per time resolution.
+df_renamed_list <- list()
+df_label_list <- list()
+
+# for loop to read in each time resolution
+for (time_res in time_res_tests) {
+  path <- glue(
+    "/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/",
+    "pe_curves/data/clean_growth_{time_res}.csv"
+  )
+
+  # Read and prepare data for one temporal resolution.
+  df_main <- read.csv(path) |>
+    rename(datetime = time) |>
+    mutate(
+      datetime = ymd_hms(datetime),
+      time = format(datetime, "%H:%M:%S"),
+      yr = year(datetime),
+      mnth = month(datetime),
+      dy = day(datetime)
+    ) |>
+    select(-X) |>
+    group_by(cruise, cruise_day, pop) |>
+    mutate(
+      index_id = paste0("pi-", cur_group_id())
+    ) |>
+    ungroup()
+
+  cat(
+    "Time resolution: ", time_res,
+    " | Total PI groups: ",
+    n_distinct(df_main$index_id),
+    "\n",
+    sep = ""
+  )
+
+  # Keep the first 9 hours and rename PI-model columns.
+  df_renamed <- df_main |>
+    filter(hour <= 9) |>
+    rename(
+      P = slope,
+      I = par_smooth
+    ) |>
+    mutate(
+      time_res = time_res
+    )
+
+  # Save the full PI-model input data for this time resolution.
+  df_renamed_list[[time_res]] <- df_renamed
+
+  # Split data into one data frame per PI curve.
+  df_sub <- df_renamed |>
+    group_by(index_id) |>
+    group_split()
+
+  # Function to label P–I curve data type.
+  modified_DataType_piCurve <- function(df) {
+    tibble(
+      data_type = DataType_piCurve(data = df)$data_type,
+      index_id = unique(df$index_id)
+    )
+  }
+
+  # Label each PI curve, then retain time-resolution metadata.
+  df_label <- parallel::mclapply(
+    df_sub,
+    function(x) modified_DataType_piCurve(df = x),
+    mc.cores = 13
+  ) |>
+    bind_rows() |>
+    mutate(
+      time_res = time_res
+    )
+
+  # Save labels for this time resolution.
+  df_label_list[[time_res]] <- df_label
+}
+
+# Combine all time-resolution data frames after the loop.
+df_renamed_all <- bind_rows(df_renamed_list)
+
+# One row per index_id / PI curve, including data-type and time resolution.
+df_label_all <- bind_rows(df_label_list)
+```
+
+Most samples here are classified as "Uncertain"
+```{r} 
+df_label_all |>
+  count(time_res, data_type) |>
+  group_by(time_res) |>
+  mutate(
+    perc = round(100 * n / sum(n), 1)
+  ) |>
+  ungroup()
+
+
+# save
+# setwd("/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/pe_curves/")
+# write_csv(df_renamed_all, '../data/all_pi_labels.csv')
+```
+
+
+helper function to add weights to low irradiance values
+```{r}
+upweight_low_light <- function(
+  df,
+  irradiance_col = "I",
+  low_I_min = 0,
+  low_I_max = 500,
+  low_I_weight = 3
+) {
+  # Keep all observations once.
+  df_weighted <- df
+
+  # Identify observations to replicate.
+  low_I_rows <- df |>
+    filter(
+      !is.na(.data[[irradiance_col]]),
+      .data[[irradiance_col]] >= low_I_min,
+      .data[[irradiance_col]] <= low_I_max
+    )
+
+  # Add extra copies. For weight = 3, each low-I observation appears 3 times total.
+  if (nrow(low_I_rows) > 0 && low_I_weight > 1) {
+    df_weighted <- bind_rows(
+      df,
+      low_I_rows[rep(seq_len(nrow(low_I_rows)), each = low_I_weight - 1), ]
+    )
+  }
+
+  df_weighted
+}
+```
+
+Run through original PI model
+```{r}
+# Lists to hold successful fit results and plot objects.
+fit_par_list <- list()
+pi_plot_data_list <- list()
+weight <- 3
+
+for (time_res_i in unique(df_renamed_all$time_res)) {
+
+  message("Fitting curves for time resolution: ", time_res_i)
+
+  df_time_res <- df_renamed_all |>
+    filter(time_res == time_res_i)
+
+  # Include time_res in grouping because index_id may repeat among files.
+  df_sub <- df_time_res |>
+    group_by(time_res, index_id) |>
+    group_split()
+
+  for (i in seq_along(df_sub)) {
+
+    df <- df_sub[[i]]
+
+    # Extract one value for each curve-level metadata field.
+    index_id_i <- unique(df$index_id)[1]
+    cruise_i <- unique(df$cruise)[1]
+    cruise_day_i <- unique(df$cruise_day)[1]
+    pop_i <- unique(df$pop)[1]
+
+    if (nrow(df) <= 4) {
+      message(
+        "Skipping curve ", index_id_i,
+        " at ", time_res_i,
+        ": fewer than 5 rows"
+      )
+      next
+    }
+
+    tryCatch({
+      # calculated with low light weighted values
+      # Create a replicated version only for fitting and original df for plotting/metadata
+      df_weighted <- upweight_low_light(
+        df,
+        irradiance_col = "I",
+        low_I_min = 0,
+        low_I_max = 250,
+        low_I_weight = weight
+      )
+            
+      fit <- Fit_piModel(
+        data = df_weighted,
+        STATapp = "MSE"
+      )
+
+      # Store fitted parameter results.
+      fit_par_list[[length(fit_par_list) + 1]] <- tibble(
+        time_res = time_res_i,
+        index_id = index_id_i,
+        cruise = cruise_i,
+        cruise_day = cruise_day_i,
+        pop = pop_i,
+        n_obs = nrow(df),
+        Pmax = unname(fit$par["Pmax"]),
+        alpha = unname(fit$par["alpha"]),
+        beta = unname(fit$par["beta"])
+      )
+
+      # Build the ggplot object.
+      pi_plot <- Plot_piCurve(
+        fit,
+        df_weighted,
+        length_out = 200,
+        n_cores = 6
+      ) +
+        ggtitle(
+        paste("Curve:", index_id_i)
+        ) +
+        theme(
+          axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14)
+        )
+
+      # Save the plot and metadata together.
+      pi_plot_data_list[[length(pi_plot_data_list) + 1]] <- list(
+        plot = pi_plot,
+        time_res = time_res_i,
+        index_id = index_id_i,
+        cruise = cruise_i,
+        cruise_day = cruise_day_i,
+        pop = pop_i
+      )
+
+    }, error = function(e) {
+      message(
+        "Skipping curve ", index_id_i,
+        " at ", time_res_i,
+        ": ", conditionMessage(e)
+      )
+    })
+  }
+}
+
+# Combine fit results after all loops complete.
+fit_par_all <- bind_rows(fit_par_list)
+```
+
+Save plots in a PDF
+```{r}
+library(patchwork)
+
+fig_path <- "/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/pe_curves/figures/pi_curves"
+
+# Convert saved plot objects and metadata into a tibble.
+pi_plot_index <- tibble(
+  plot = lapply(pi_plot_data_list, `[[`, "plot"),
+  time_res = sapply(pi_plot_data_list, `[[`, "time_res"),
+  index_id = sapply(pi_plot_data_list, `[[`, "index_id"),
+  cruise = sapply(pi_plot_data_list, `[[`, "cruise"),
+  cruise_day = sapply(pi_plot_data_list, `[[`, "cruise_day"),
+  pop = sapply(pi_plot_data_list, `[[`, "pop")
+)
+
+output_dir <- fig_path
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (pop_i in unique(pi_plot_index$pop)) {
+  for (time_res_i in unique(pi_plot_index$time_res)) {
+
+    # Filter to one population and one time resolution.
+    pop_time_plots <- pi_plot_index |>
+      filter(
+        pop == pop_i,
+        time_res == time_res_i
+      )
+
+    # Do not make an empty PDF.
+    if (nrow(pop_time_plots) == 0) {
+      next
+    }
+
+    # Make population name safe for file names.
+    pop_file_name <- gsub(
+      pattern = "[^A-Za-z0-9_-]",
+      replacement = "_",
+      x = as.character(pop_i)
+    )
+
+    # Example: PI_curves_pro_3min.pdf
+    pdf_file <- paste0(
+      "PI_curves_",
+      pop_file_name,
+      "_",
+      time_res_i,
+      "weight",
+      weight,
+      ".pdf"
+    )
+
+    pdf(
+      file = file.path(output_dir, pdf_file),
+      width = 14,
+      height = 9,
+      onefile = TRUE
+    )
+
+    # Each cruise becomes a separate page in the PDF.
+    for (cruise_i in unique(pop_time_plots$cruise)) {
+
+      cruise_plots <- pop_time_plots |>
+        filter(cruise == cruise_i) |>
+        arrange(cruise_day)
+
+      # One panel per cruise day.
+      page_plot <- wrap_plots(
+        cruise_plots$plot,
+        ncol = 4
+      ) +
+        plot_annotation(
+          title = paste(
+            "P–I curves | Population:", pop_i,
+            "| Resolution:", time_res_i,
+            "| Cruise:", cruise_i
+          ),
+          subtitle = "Each panel represents one cruise day"
+        ) &
+        theme(
+          plot.title = element_text(face = "bold", size = 16),
+          axis.text = element_text(size = 9),
+          axis.title = element_text(size = 10)
+        )
+
+      print(page_plot)
+    }
+
+    dev.off()
+
+    message(
+      "Saved PDF: ",
+      file.path(output_dir, pdf_file)
+    )
+  }
+}
+```
+
+# now double check results
+```{r}
+## how many pi curves per population were generated for weighted values? 
+cat("1H: ", nrow(subset(fit_par_all, time_res == '1H')), "\n")
+
+cat("30min: ", nrow(subset(fit_par_all, time_res == '30min')), "\n")
+
+cat("15min: ", nrow(subset(fit_par_all, time_res == '15min')), "\n")
+
+```
+
+
+```{r}
+library(tidyr)
+fit_par_long <- fit_par_all %>%
+  pivot_longer(
+    cols = c(Pmax, alpha, beta),
+    names_to = "parameter",
+    values_to = "estimate"
+  ) %>%
+  filter(is.finite(estimate)) %>%
+  mutate(
+    time_res = factor(
+      time_res,
+      levels = c("3min", "15min", "30min", "1H")
+    ),
+    parameter = factor(
+      parameter,
+      levels = c("Pmax", "alpha", "beta")
+    )
+  )
+
+# log normalize
+fit_par_log_long <- fit_par_long %>%
+  filter(
+    parameter %in% c("Pmax", "alpha", "beta"),
+    estimate > 0
+  ) %>%
+  mutate(
+    log_estimate = log(estimate)
+  )
+
+# Calculate Tukey outlier thresholds separately for each
+# time-resolution × parameter distribution.
+outlier_limits <- fit_par_log_long %>%
+  group_by(time_res, parameter) %>%
+  summarise(
+    q1 = quantile(log_estimate, 0.25, na.rm = TRUE),
+    q3 = quantile(log_estimate, 0.75, na.rm = TRUE),
+    iqr = IQR(log_estimate, na.rm = TRUE),
+    lower_limit = q1 - 1.5 * iqr,
+    upper_limit = q3 + 1.5 * iqr,
+    .groups = "drop"
+  )
+
+# Create a plot-only data frame without Tukey outliers.
+fit_par_plot <- fit_par_log_long %>%
+  left_join(
+    outlier_limits,
+    by = c("time_res", "parameter")
+  ) %>%
+  filter(
+    log_estimate >= lower_limit,
+    log_estimate <= upper_limit
+  ) %>%
+  select(
+    -q1,
+    -q3,
+    -iqr,
+    -lower_limit,
+    -upper_limit
+  )
+
+ggplot(
+  fit_par_log_long,
+  aes(x = parameter, y = log_estimate, fill = parameter)
+) +
+  geom_violin(
+    trim = FALSE,
+    alpha = 0.55,
+    color = NA
+  ) +
+  geom_boxplot(
+    width = 0.16,
+    outlier.shape = NA,
+    fill = "white",
+    color = "black",
+    linewidth = 0.4
+  ) +
+  geom_jitter(
+    aes(color = parameter),
+    width = 0.10,
+    height = 0,
+    alpha = 0.35,
+    size = 1.4,
+    show.legend = FALSE
+  ) +
+  facet_grid(
+    rows = vars(parameter),
+    cols = vars(time_res),
+    scales = "free_y"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Pmax" = "#1B9E77",
+      "alpha" = "#7570B3",
+      "beta" = "#D95F02"
+    ),
+    guide = "none"
+  ) +
+  scale_color_manual(
+    values = c(
+      "Pmax" = "#1B9E77",
+      "alpha" = "#7570B3",
+      "beta" = "#D95F02"
+    ),
+    guide = "none"
+  ) +
+  labs(
+    title = "P–I curve parameter distributions across time resolutions",
+    x = NULL,
+    y = "Fitted parameter value"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.background = element_rect(fill = "grey92", color = NA),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.spacing = grid::unit(0.8, "lines")
+  )
+```
+
+Look at distribution shape instead 
+```{r}
+ggplot(fit_par_plot, aes(x = log_estimate)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 30,
+    fill = "grey75",
+    color = "white",
+    linewidth = 0.3
+  ) +
+  geom_density(
+    fill = "#2C7FB8",
+    color = "#08519C",
+    alpha = 0.30,
+    linewidth = 0.8,
+    adjust = 1
+  ) +
+  facet_grid(
+    parameter ~ time_res,
+    scales = "free_x"
+  ) +
+  labs(
+    title = "P–I parameter distributions across sampling resolutions",
+    x = "Fitted parameter estimate",
+    y = "Density"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_rect(fill = "grey92", color = NA),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.spacing = grid::unit(0.9, "lines")
+  )
+```
+Split between populationss
+```{r}
+ggplot(fit_par_plot, aes(x = log_estimate)) +
+  geom_histogram(
+    aes(
+      y = after_stat(density),
+      fill = pop
+    ),
+    bins = 30,
+    color = "white",
+    linewidth = 0.3,
+    position = "identity",
+    alpha = 0.45
+  ) +
+  geom_density(
+    aes(
+      color = pop,
+      fill = pop
+    ),
+    alpha = 0.18,
+    linewidth = 0.9,
+    adjust = 1
+  ) +
+  facet_grid(
+    parameter ~ time_res,
+    scales = "free_x"
+  ) +
+  scale_fill_viridis_d(
+    option = "D",
+    end = 0.85,
+    name = "Population"
+  ) +
+  scale_color_viridis_d(
+    option = "D",
+    end = 0.85,
+    name = "Population"
+  ) +
+  labs(
+    title = "PI distributions",
+    x = expression("Log-Normalized Parameter"),
+    y = "Density"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_rect(fill = "grey92", color = NA),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.spacing = grid::unit(0.9, "lines"),
+    legend.position = "bottom"
+  )
+```
+
+Run through PI model anyways- "double-tanh model on ls & ph data using the following lines of codes engaging 14 cores of cpu".
+
+- can i detrend the data from light stuff? 
+
+Send coordinates, time, and resolution if I have any problems
+```{r}
+# functions
+fit_2tanh_model <- function(x) {
+  fit_noDR <- Fit_piModel(data = x, Control = list(maxit = 5000))
+  
+  fit <- Fit_piModel(
+    data = x,
+    DarkReactionRate_R = T,
+    Control = list(maxit = 5000)
+  )
+  
+  
+  tidy_output <-
+    function(model, data = x) {
+      params <- model$par
+      mse <- model$value
+      sqa <- model$SQA
+      
+      c(index_id = unique(x$index_id),
+        params,
+        mse = mse,
+        sqa)
+    }
+  
+  if (fit_noDR$SQA["R2"] >= fit$SQA["R2adj"]) {
+    tidy_output(model = fit_noDR)
+  } else{
+    tidy_output(model = fit)
+  }
+}
+```
+
+
+```{r}
+library(readr)
+# save to another file now so i can do this in python :')
+write_csv(fit_par_plot, "../data/new_pi_data_weight1.csv")
+```

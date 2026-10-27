@@ -1,0 +1,235 @@
+---
+title: "new_PI_curves_v2"
+author: "Katherine Qi"
+date: "2026-10-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(piCurve)
+library(parallel)
+library(lubridate)
+library(glue)
+
+# reset environment
+rm(list = ls())
+```
+
+
+```{r}
+# helper function to label PI curve data type.
+modified_DataType_piCurve <- function(df) {
+  tibble(
+    data_type = DataType_piCurve(data = df)$data_type,
+    index_id = unique(df$index_id)
+  )
+}
+```
+
+## Data cleaning
+```{r}
+## original cleaned data from M
+og_path <-  "/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/pe_curves/mohammad/data/cleaned-data/testData/pro_hourly_growth_par-cleaned-MA-Aug6-2026.csv"
+
+# new data I generated 
+time_res <- '1H'
+path <- glue(
+    "/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/",
+    "pe_curves/data/clean_growth_{time_res}.csv"
+  )
+
+df_main <- read.csv(path) |>
+  # change "time" col to "datetime"
+  rename(datetime = time) |>
+  # create new cols for year, month, and day
+  mutate(
+    datetime = ymd_hms(datetime),
+    time = format(datetime, "%H:%M:%S"),
+    yr = year(datetime),
+    mnth = month(datetime),
+    dy = day(datetime)
+  ) |>
+  # drop original index col
+  select(-X) |>
+  # group by each cruise, day, and population to generate integer labels for each curve
+  group_by(cruise, cruise_day, pop) |>
+  mutate(
+    index_id = paste0("pi-", cur_group_id())
+  ) |>
+  ungroup() # removes grouping structure
+# so far data looks good 
+
+# print # of pi groups
+cat(
+    "Time resolution: ", time_res,
+    " | Total PI groups: ",
+    n_distinct(df_main$index_id),
+    "\n",
+    sep = ""
+  )
+# Only keep the first 8 hours of each day and rename PI-model columns
+max_hours = 8
+df_renamed <- df_main |>
+  filter(hour <= 8) |>
+  # rename cols for PI curve model
+  rename(
+    P = slope,
+    I = par_smooth
+  ) |>
+  mutate(
+    time_res = time_res
+  )
+# Split data into one data frame per PI curve
+df_sub <- df_renamed |>
+  group_by(index_id) |>
+  group_split()
+
+# Label each PI curve, then retain time-resolution metadata.
+  df_label <- parallel::mclapply(
+    df_sub,
+    function(x) modified_DataType_piCurve(df = x),
+    mc.cores = 13
+  ) |>
+    bind_rows() |>
+    mutate(
+      time_res = time_res
+    )
+
+# count the number of data types by time resolution
+df_label |>
+  count(time_res, data_type) |>
+  group_by(time_res) |>
+  mutate(
+    perc = round(100 * n / sum(n), 1)
+  ) |>
+  ungroup()
+  
+# most datasets are uncertain and light limited for 1H data
+subset(df_renamed, (cruise == 'KM1513' & pop == 'prochloro' & cruise_day == 2), select = c(I, P))
+```
+
+Helper function to upweight low irradiance values
+```{r}
+upweight_low_light <- function(
+  df,
+  irradiance_col = "I",
+  low_I_min = 0,
+  low_I_max = 500,
+  low_I_weight = 3
+) {
+  # Keep all observations once.
+  df_weighted <- df
+
+  # Identify observations to replicate.
+  low_I_rows <- df |>
+    filter(
+      !is.na(.data[[irradiance_col]]),
+      .data[[irradiance_col]] >= low_I_min,
+      .data[[irradiance_col]] <= low_I_max
+    )
+
+  # Add extra copies. For weight = 3, each low-I observation appears 3 times total.
+  if (nrow(low_I_rows) > 0 && low_I_weight > 1) {
+    df_weighted <- bind_rows(
+      df,
+      low_I_rows[rep(seq_len(nrow(low_I_rows)), each = low_I_weight - 1), ]
+    )
+  }
+
+  df_weighted
+}
+```
+
+```{r}
+# Lists to hold successful fit results and plot objects.
+fit_par_list <- list()
+weight <- 1 # set no weight for now
+
+# run only on diel cruise now
+test_diel <- subset(df_renamed, (cruise == 'KM1513' & pop == 'prochloro')) %>% arrange(cruise_day, hour)
+
+# group by index id
+df_sub <- test_diel |>
+    group_by(time_res, index_id) |>
+    group_split()
+
+# loop through each PI curve and save data 
+for (i in seq_along(df_sub)) {
+    df <- df_sub[[i]]
+    
+    # Extract one value for each curve-level metadata field.
+    index_id_i <- unique(df$index_id)[1]
+    cruise_i <- unique(df$cruise)[1]
+    cruise_day_i <- unique(df$cruise_day)[1]
+    pop_i <- unique(df$pop)[1]
+    
+    # skip if not enough data per curve (at least 4 hours of data)
+    if (nrow(df) <= 4) {
+      message(
+        "Skipping curve ", index_id_i,
+        ": fewer than 5 rows"
+      )
+      next
+    }
+    
+    # set weights for low light levels
+    df_weighted <- upweight_low_light(
+        df,
+        irradiance_col = "I",
+        low_I_min = 0,
+        low_I_max = 250,
+        low_I_weight = weight
+    )
+    
+    # run weighted fit in PI model
+    fit <- Fit_piModel(
+        data = df_weighted,
+        STATapp = "MSE"
+      )
+    
+    # Store fitted parameter results.
+      fit_par_list[[length(fit_par_list) + 1]] <- tibble(
+        index_id = index_id_i,
+        cruise = cruise_i,
+        cruise_day = cruise_day_i,
+        pop = pop_i,
+        n_obs = nrow(df),
+        Pmax = unname(fit$par["Pmax"]),
+        alpha = unname(fit$par["alpha"]),
+        beta = unname(fit$par["beta"])
+      )
+    # plot PI curve  
+    p <- Plot_piCurve(
+        fit,
+        df_weighted,
+        length_out = 200,
+        n_cores = 6
+      ) +
+        ggtitle(
+        paste("Day:", cruise_day_i)
+        ) +
+        theme(
+          axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14)
+        )
+    print(p + # increase the size of axis title and font
+    theme(axis.text = element_text(size = 14), axis.title = element_text(size = 14)))
+      
+}
+```
+
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
