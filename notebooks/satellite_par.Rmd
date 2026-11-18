@@ -6,6 +6,7 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
+rm(list = ls())
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
@@ -15,16 +16,413 @@ This is an R Markdown document. Markdown is a simple formatting syntax for autho
 
 When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
 
-```{r cars}
-summary(cars)
+```{r}
+library(piCurve)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(suncalc)
+library(lutz)
+library(glue)
+
+# set wd and read in data
+setwd("/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/pe_curves/notebooks")
+# use 30 min data
+timeres <- '30min'
+path <- glue('../data/smoothed_par_data/hot_cruise_smooth_{timeres}.csv')
+# read in all available par data and the bad par data
+par_df <- read.csv(path)
+# bad_par <- read.csv('../data/smoothed_par_data/bad_par_cruises_30min.csv')
+##### for now include this just so we have it ######
+# exclude data from bad par cruises from par_smooth column
+# par_df <- par_df %>%
+#   mutate(
+#     par_smooth = if_else(
+#       cruise %in% bad_par$cruise,
+#       NaN,
+#       par_smooth
+#     )
+#   )
 ```
 
-## Including Plots
+## original testing code (1 cruise at a time)
+```{r}
+# # calculate PAR for each time point
+# ## test 
+# time_utc <- as.POSIXct("2015-07-25 16:30:00", tz = 'UTC')
+# lat <- 24.582640
+# lon <- -156.363710
+# # get local time zone
+# tz_local <- tz_lookup_coords(lat, lon, method = "fast")
+# 
+# # convert datetime to local date and time
+# date_local <- as.Date(time_utc, tz = tz_local)
+# time_local <- format(
+#   time_utc,
+#   format = "%H:%M:%S",
+#   tz = tz_local
+# )
+# # this is in local time so need to convert
+# sza <-
+#     solar_zenith_angle_piCurve(date = date_local, time = time_local, latitude = lat, longitude = lon)
+# 
+# # use µmol photons / m2 / s to stay consistent
+# surface_par <- PAR_sea_surface_piCurve(zenith_angle = sza, 
+#                                        GreggCarder1990, 
+#                                        sample_date = Date, 
+#                                        units = 'umol photons m^-2 s^-1')
+```
 
-You can also embed plots, for example:
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+## Clean up time, lat, lon columns
+```{r}
+# Ensure timestamps are interpreted as UTC.
+# If time is already correctly parsed as POSIXct, leave it unchanged.
+if (!inherits(par_df$time, "POSIXct")) {
+  par_df$time <- as.POSIXct(
+    par_df$time,
+    format = "%Y-%m-%d %H:%M:%S",
+    tz = "UTC"
+  )
+}
+# Convert character/factor coordinates to numeric safely.
+to_numeric <- function(x) {
+  suppressWarnings(as.numeric(trimws(as.character(x))))
+}
+
+# Clean and flag coordinates, preserving the original columns.
+par_df <- par_df %>%
+  ungroup() %>%
+  mutate(
+    lat_clean = to_numeric(lat),
+    lon_clean = to_numeric(lon),
+
+    coord_status = case_when(
+      !is.finite(lat_clean) | !is.finite(lon_clean) ~
+        "missing_or_non_numeric",
+
+      abs(lat_clean) > 90 ~
+        "invalid_latitude",
+
+      lon_clean < -180 | lon_clean > 360 ~
+        "invalid_longitude",
+
+      lon_clean > 180 ~
+        "longitude_converted_from_0_360",
+
+      TRUE ~ "valid"
+    ),
+
+    # Only convert plausible 0–360-degree longitudes.
+    lon_clean = if_else(
+      is.finite(lon_clean) &
+        lon_clean > 180 &
+        lon_clean <= 360,
+      lon_clean - 360,
+      lon_clean
+    ),
+
+    coords_valid = coord_status %in% c(
+      "valid",
+      "longitude_converted_from_0_360"
+    ),
+
+    # Exclude unusable coordinate pairs from downstream calculations.
+    lat_clean = if_else(coords_valid, lat_clean, NA_real_),
+    lon_clean = if_else(coords_valid, lon_clean, NA_real_)
+  )
+```
+
+## Loop through and recalculate PAR based on astronomical model
+```{r}
+# Calculate local times, solar zenith angles, and PAR.
+par_df <- par_df %>%
+  rowwise() %>%
+  mutate(
+    # Keep lookup failures from stopping the entire loop
+    tz_local = if (!coords_valid || is.na(time)) {
+      NA_character_
+    } else {
+      tryCatch(
+        tz_lookup_coords(
+          lat = lat_clean,
+          lon = lon_clean,
+          method = "fast",
+          warn = FALSE
+        ),
+        error = function(e) NA_character_
+      )
+    },
+    # get local date from time zone
+    date_local = if (is.na(tz_local)) {
+      as.Date(NA_character_)
+    } else {
+      as.Date(time, tz = tz_local)
+    },
+  # get local time from time zone
+    time_local = if (is.na(tz_local)) {
+      NA_character_
+    } else {
+      format(
+        time,
+        format = "%H:%M:%S",
+        tz = tz_local
+      )
+    },
+    # calculate sun zenith angle from local date and time
+    sza = if (is.na(tz_local)) {
+      NA_real_
+    } else {
+      solar_zenith_angle_piCurve(
+        date = date_local,
+        time = time_local,
+        latitude = lat_clean,
+        longitude = lon_clean
+      )
+    },
+    # check zenith angle is valid for calculating surface PAR
+    sat_par = if (!is.finite(sza)) { # not nan
+      NA_real_
+    } else if (sza >= 90) { # not night
+      0
+    } else { # calculate PAR
+      result <- PAR_sea_surface_piCurve(
+        zenith_angle = sza,
+        database_info = GreggCarder1990,
+        sample_date = date_local,
+        units = "umol photons m^-2 s^-1" # same units as ship radiometer
+      )
+      # save into dataframe
+      as.numeric(result$PAR[1])
+    },
+    # report status of calculation
+    calculation_status = case_when(
+      !coords_valid ~ "invalid_coordinates",
+      is.na(time) ~ "missing_or_invalid_time",
+      is.na(tz_local) ~ "timezone_lookup_failed",
+      !is.finite(sza) ~ "invalid_solar_zenith",
+      !is.finite(sat_par) ~ "invalid_PAR",
+      TRUE ~ "ok"
+    )
+  ) %>%
+  ungroup()
+```
+
+## plot distributions of satellite derived PAR + smoothed PAR
+```{r}
+library(patchwork)
+
+# change from wide to long
+par_long <- par_df %>%
+  select(cruise, cruise_day, day_hour, sat_par, par_smooth) %>%
+  pivot_longer(
+    cols = c(sat_par, par_smooth),
+    names_to = "variable",
+    values_to = "PAR"
+  ) %>%
+  mutate(
+    variable = factor(
+      variable,
+      levels = c("sat_par", "par_smooth")
+    )
+  )
+
+# Summarize observation counts and availability.
+par_summary <- par_long %>%
+  group_by(variable) %>%
+  summarise(
+    n_total = n(),
+    n_available = sum(!is.na(PAR)),
+    n_missing = sum(is.na(PAR)),
+    .groups = "drop"
+  )
+# calcualte proportion of available to total data
+availability <- par_df %>%
+  summarise(
+    sat_par = sum(!is.na(sat_par)) / nrow(par_df),
+    par_smooth = sum(!is.na(par_smooth)) / nrow(par_df)
+  ) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "proportion"
+  ) %>%
+  mutate(
+    variable = factor(
+      variable,
+      levels = c("sat_par", "par_smooth")
+    ),
+    label = scales::percent(proportion, accuracy = 0.1)
+  )
+
+par_colors <- c(
+  sat_par = "#4477AA",
+  par_smooth = "#EE9977"
+)
+
+# Panel A: non-missing observation counts.
+p_counts <- ggplot(
+  par_summary,
+  aes(x = variable, y = n_available, fill = variable)
+) +
+  geom_col(width = 0.6) +
+  geom_text(
+    aes(label = scales::comma(n_available)),
+    vjust = -0.4,
+    size = 4
+  ) +
+  scale_fill_manual(values = par_colors) +
+  scale_y_continuous(
+    labels = scales::label_comma(),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Observation counts",
+    x = NULL,
+    y = "Total observations"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+# Panel B: available versus missing percentages.
+p_availability <- ggplot(
+  availability,
+  aes(x = variable, y = proportion, fill = variable)
+) +
+  geom_col(width = 0.6) +
+  geom_text(
+    aes(label = label),
+    vjust = -0.4,
+    size = 4
+  ) +
+  scale_fill_manual(values = par_colors) +
+  scale_y_continuous(
+    labels = scales::label_percent(),
+    breaks = seq(0, 1, by = 0.25),
+    limits = c(0, 1),
+    expand = expansion(mult = c(0, 0.10))
+  ) +
+  labs(
+    title = "Data availability",
+    x = NULL,
+    y = "Percentage of all rows"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+# Panel C: distributions of non-missing values.
+p_box <- ggplot(
+  filter(par_long, !is.na(PAR)),
+  aes(x = variable, y = PAR, fill = variable)
+) +
+  geom_boxplot(
+    width = 0.6,
+    outlier.alpha = 0.2,
+    outlier.size = 0.7
+  ) +
+  scale_fill_manual(values = par_colors) +
+  labs(
+    title = "PAR distributions",
+    x = NULL,
+    y = "PAR (µmol photons / m2 / s-1"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+# Combine panels A, B, and C.
+combined_plot <- (
+  p_counts + p_availability + p_box
+) +
+  plot_layout(ncol = 3) +
+  plot_annotation(tag_levels = "A")
+
+combined_plot
+```
+
+
+```{r}
+## plot par_smooth against satellite PAR
+# only look at day time values (pro)
+diel_cruise <- subset(par_df, (cruise == 'KM1906'
+                               & pop == 'prochloro'
+                               & time_of_day != 'night'))
+
+ggplot(diel_cruise, aes(x = par_smooth, y = sat_par, colour = day_hour)) + 
+         geom_point()
+```
+
+
+## Plot distributions of PAR data for 1 cruise (Diel 2015)
+```{r}
+# only look at day time values (pro)
+test_cruise <- 'CN11ID'
+diel_cruise <- subset(par_df, (cruise == test_cruise 
+                               & pop == 'prochloro'))
+
+
+ggplot(
+  filter(diel_cruise, !is.na(par_smooth)),
+  aes(x = par_smooth, y = sat_par)
+) +
+  geom_point() +
+  facet_wrap(
+    ~ cruise_day,
+    ncol = 4
+  ) +
+  labs(
+    title = glue("PAR distributions by cruise day: {cruise}"),
+    x = "PAR",
+    y = "Number of observations"
+  ) +
+  theme_classic(base_size = 12)
+
+## subset diel cruise long format
+diel_cruise_long <- subset(par_long, (cruise == test_cruise))
+# drop duplicates
+uniq_long <- diel_cruise_long %>% 
+  distinct(cruise, cruise_day, day_hour, .keep_all = TRUE)
+ggplot(
+  filter(diel_cruise_long,),
+  aes(x = day_hour, y = PAR, colour = variable)
+) +
+  geom_point() +
+  facet_wrap(
+    ~ cruise_day,
+    ncol = 4
+  ) +
+  labs(
+    title = glue("PAR distributions by cruise day: {test_cruise}"),
+    x = "PAR",
+    y = "Number of observations"
+  ) +
+  theme_classic(base_size = 12)
+
+#### Run PI model through this and compare the data
+# ggplot(
+#   filter(diel_cruise, !is.na(par_smooth)),
+#   aes(x = par_smooth)
+# ) +
+#   geom_histogram(
+#     bins = 30,
+#     fill = "#4477AA",
+#     color = "white"
+#   ) +
+#   facet_wrap(
+#     ~ cruise_day,
+#     ncol = 4
+#   ) +
+#   labs(
+#     title = "PAR distributions by cruise day: KM1513",
+#     x = "PAR",
+#     y = "Number of observations"
+#   ) +
+#   theme_classic(base_size = 12)
+
+```
+
+```{r}
+
+write.csv(par_df, "../data/smoothed_par_data/sat_par_data.csv", row.names = FALSE)
 ```
 
 Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

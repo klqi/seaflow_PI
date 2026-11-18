@@ -16,15 +16,16 @@ This is an R Markdown document. Markdown is a simple formatting syntax for autho
 When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
 
 ```{r}
+# reset environment
+rm(list = ls())
+graphics.off()
+
 library(dplyr)
 library(ggplot2)
 library(piCurve)
 library(parallel)
 library(lubridate)
 library(glue)
-
-# reset environment
-rm(list = ls())
 ```
 
 
@@ -42,12 +43,15 @@ modified_DataType_piCurve <- function(df) {
 ```{r}
 ## original cleaned data from M
 og_path <-  "/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/pe_curves/mohammad/data/cleaned-data/testData/pro_hourly_growth_par-cleaned-MA-Aug6-2026.csv"
+setwd("/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/pe_curves/notebooks")
 
 # new data I generated 
-time_res <- '1H'
+time_res <- '30min'
+filter_type <- 'savgol'
+
 path <- glue(
     "/Users/Kathy/Library/CloudStorage/OneDrive-UW/Desktop/UW/projects/",
-    "pe_curves/data/clean_growth_{time_res}.csv"
+    "pe_curves/data/smoothed_growth_data/clean_growth_{time_res}_{filter_type}.csv"
   )
 
 df_main <- read.csv(path) |>
@@ -86,7 +90,7 @@ df_renamed <- df_main |>
   # rename cols for PI curve model
   rename(
     P = slope,
-    I = par_smooth
+    I = norm_par_smooth
   ) |>
   mutate(
     time_res = time_res
@@ -97,7 +101,7 @@ df_sub <- df_renamed |>
   group_split()
 
 # Label each PI curve, then retain time-resolution metadata.
-  df_label <- parallel::mclapply(
+df_label <- parallel::mclapply(
     df_sub,
     function(x) modified_DataType_piCurve(df = x),
     mc.cores = 13
@@ -117,8 +121,14 @@ df_label |>
   ungroup()
   
 # most datasets are uncertain and light limited for 1H data
-subset(df_renamed, (cruise == 'KM1513' & pop == 'prochloro' & cruise_day == 2), select = c(I, P))
+# subset(df_renamed, (cruise == 'KM1513' & pop == 'prochloro' & cruise_day == 2), select = c(I, P))
 ```
+
+# save data
+```{r}
+write.csv(df_renamed, '../data/all_pi_labels.csv')
+```
+
 
 Helper function to upweight low irradiance values
 ```{r}
@@ -126,7 +136,7 @@ upweight_low_light <- function(
   df,
   irradiance_col = "I",
   low_I_min = 0,
-  low_I_max = 500,
+  low_I_max = 1000,
   low_I_weight = 3
 ) {
   # Keep all observations once.
@@ -152,82 +162,836 @@ upweight_low_light <- function(
 }
 ```
 
+## TESTING (diel cruise only)
 ```{r}
 # Lists to hold successful fit results and plot objects.
 fit_par_list <- list()
-weight <- 1 # set no weight for now
+weight <- 3
 
 # run only on diel cruise now
-test_diel <- subset(df_renamed, (cruise == 'KM1513' & pop == 'prochloro')) %>% arrange(cruise_day, hour)
+test_diel <- subset(df_renamed, (cruise == 'KM1513' & pop == 'prochloro')) |> 
+  arrange(cruise_day, hour)
 
-# group by index id
-df_sub <- test_diel |>
-    group_by(time_res, index_id) |>
-    group_split()
+# loop through eacy population
+for (curr_pop in unique(df_renamed$pop)) {
+  # subset population DF
+  pop_df <- subset(test_diel, pop == curr_pop)
+  # group by cruise day and index ID
+  df_sub <- pop_df |>
+      group_by(cruise_day, index_id) |>
+      group_split()
+  # loop through each PI curve and save data 
+  for (i in seq_along(df_sub)) {
+      df <- df_sub[[i]]
+      
+      # Extract one value for each curve-level metadata field.
+      index_id_i <- unique(df$index_id)[1]
+      cruise_i <- unique(df$cruise)[1]
+      cruise_day_i <- unique(df$cruise_day)[1]
+      pop_i <- curr_pop
+      
+      # skip if not enough data per curve (at least 4 hours of data)
+      if (nrow(df) <= 4) {
+        message(
+          "Skipping curve ", index_id_i,
+          ": fewer than 5 rows"
+        )
+        next
+      }
+      # set weights for low light levels
+      df_weighted <- upweight_low_light(
+          df,
+          irradiance_col = "I",
+          low_I_min = 0,
+          low_I_max = 250,
+          low_I_weight = weight
+      )
+      tryCatch({
+        # # run weighted fit in PI model
+        # fit <- Fit_piModel(
+        #     data = df_weighted,
+        #     STATapp = "MSE"
+        #   )
+        
+        fit <- Fit_piModel(
+          data = df_weighted,
+          DarkReactionRate_R = T,
+          Control = list(maxit = 5000)
+        )
 
-# loop through each PI curve and save data 
-for (i in seq_along(df_sub)) {
-    df <- df_sub[[i]]
-    
-    # Extract one value for each curve-level metadata field.
-    index_id_i <- unique(df$index_id)[1]
-    cruise_i <- unique(df$cruise)[1]
-    cruise_day_i <- unique(df$cruise_day)[1]
-    pop_i <- unique(df$pop)[1]
-    
-    # skip if not enough data per curve (at least 4 hours of data)
-    if (nrow(df) <= 4) {
+        # Store fitted parameter results.
+        fit_par_list[[length(fit_par_list) + 1]] <- tibble(
+            index_id = index_id_i,
+            cruise = cruise_i,
+            cruise_day = cruise_day_i,
+            pop = pop_i,
+            n_obs = nrow(df),
+            Pmax = unname(fit$par["Pmax"]),
+            alpha = unname(fit$par["alpha"]),
+            beta = unname(fit$par["beta"])
+          )
+        # plot PI curve  
+        p <- Plot_piCurve(
+            fit,
+            df_weighted,
+            length_out = 200,
+            n_cores = 6
+          ) +
+          labs(
+            title = paste("Pop:", curr_pop, "Day:", cruise_day_i),
+            subtitle = as.character(index_id_i),
+            y = expression("Growth Rate" ~ (hour^{-1}))
+          )  +
+            theme(
+              axis.text = element_text(size = 14),
+              axis.title = element_text(size = 14)
+            )
+        print(p + # increase the size of axis title and font
+        theme(axis.text = element_text(size = 14), axis.title = element_text(size = 14)))
+      }, error = function(e) {
       message(
         "Skipping curve ", index_id_i,
-        ": fewer than 5 rows"
-      )
-      next
-    }
-    
-    # set weights for low light levels
-    df_weighted <- upweight_low_light(
-        df,
-        irradiance_col = "I",
-        low_I_min = 0,
-        low_I_max = 250,
-        low_I_weight = weight
+        ": ", conditionMessage(e)
+        )}
     )
-    
-    # run weighted fit in PI model
-    fit <- Fit_piModel(
-        data = df_weighted,
-        STATapp = "MSE"
-      )
-    
-    # Store fitted parameter results.
-      fit_par_list[[length(fit_par_list) + 1]] <- tibble(
-        index_id = index_id_i,
-        cruise = cruise_i,
-        cruise_day = cruise_day_i,
-        pop = pop_i,
-        n_obs = nrow(df),
-        Pmax = unname(fit$par["Pmax"]),
-        alpha = unname(fit$par["alpha"]),
-        beta = unname(fit$par["beta"])
-      )
-    # plot PI curve  
-    p <- Plot_piCurve(
-        fit,
-        df_weighted,
-        length_out = 200,
-        n_cores = 6
-      ) +
-        ggtitle(
-        paste("Day:", cruise_day_i)
-        ) +
-        theme(
-          axis.text = element_text(size = 14),
-          axis.title = element_text(size = 14)
-        )
-    print(p + # increase the size of axis title and font
-    theme(axis.text = element_text(size = 14), axis.title = element_text(size = 14)))
-      
+  }
 }
+```
+
+## Plot distributions of PI params for diel cruise
+```{r}
+# Combine fit results after all loops complete.
+fit_par_all <- bind_rows(fit_par_list)
+# calcualte Ek
+fit_par_all$Ek <- fit_par_all$Pmax / fit_par_all$alpha
+
+# convert from wide to long 
+fit_par_long <- fit_par_all %>%
+  pivot_longer(
+    cols = c(Pmax, alpha, Ek, beta),
+    names_to = "parameter",
+    values_to = "estimate"
+  ) %>%
+  filter(is.finite(estimate)) %>%
+  mutate(
+    time_res = factor(
+      time_res,
+      levels = c("3min", "15min", "30min", "1H")
+    ),
+    parameter = factor(
+      parameter,
+      levels = c("Pmax", "alpha", "Ek", "beta")
+    )
+  )
+# log normalize
+fit_par_log_long <- fit_par_long %>%
+  filter(
+    parameter %in% c("Pmax", "alpha", "Ek", "beta"),
+    estimate > 0
+  ) %>%
+  mutate(
+    log_estimate = log(estimate)
+  )
+# save as CSV file
+write.csv(fit_par_all, "../data/diel_pi_fits_wide.csv", row.names = FALSE)
+write.csv(fit_par_log_long, "../data/diel_pi_fits.csv", row.names = FALSE)
+
+ggplot(fit_par_log_long, aes(x = log_estimate)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 30,
+    fill = "grey75",
+    color = "white",
+    linewidth = 0.3
+  ) +
+  geom_density(
+    fill = "#2C7FB8",
+    color = "#08519C",
+    alpha = 0.30,
+    linewidth = 0.8,
+    adjust = 1
+  ) +
+  facet_grid(
+    ~ parameter,
+    scales = "free_x"
+  ) +
+  labs(
+    title = "P–I parameter distributions across sampling resolutions",
+    x = "Fitted parameter estimate",
+    y = "Density"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_rect(fill = "grey92", color = NA),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.spacing = grid::unit(0.9, "lines")
+  )
+```
+
+## Run through all populations and cruises
+```{r}
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+
+# Settings
+weight <- 3
+ncols <- 4
+output_dir <- "../figures/pi_curves"
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Include all cruises and populations.
+test_diel <- df_renamed |>
+  filter(!is.na(cruise), !is.na(pop)) |>
+  arrange(pop, cruise, cruise_day, hour)
+
+# Helper: make filename-safe population labels.
+safe_filename <- function(x) {
+  gsub("[^A-Za-z0-9_-]", "_", as.character(x))
+}
+
+# helper function to save PDF after loop closes
+write_population_pdf <- function(plots, filename, width, height) {
+
+  if (length(plots) == 0L) {
+    stop("No cruise plots available to save.")
+  }
+
+  grDevices::pdf(
+    file = filename,
+    width = width,
+    height = height,
+    onefile = TRUE
+  )
+
+  pdf_device <- grDevices::dev.cur()
+
+  # Close this particular device if printing fails.
+  on.exit({
+    if (pdf_device %in% grDevices::dev.list()) {
+      try(
+        grDevices::dev.off(which = pdf_device),
+        silent = TRUE
+      )
+    }
+  }, add = TRUE)
+
+  for (cruise_name in names(plots)) {
+
+    message("Writing PDF page: ", cruise_name)
+
+    grDevices::dev.set(which = pdf_device)
+    print(plots[[cruise_name]])
+  }
+
+  # Explicitly finalize the PDF before reporting success.
+  grDevices::dev.off(which = pdf_device)
+}
+
+# Extract realized (observed) PI parameters from the predicted curve in a Plot_piCurve() plot.
+extract_observed_pars <- function(p, low_frac = 0.1) {
+
+  built <- ggplot2::ggplot_build(p)$data
+  # Use the layer with the most points (the 200-point prediction line).
+  n_pts <- vapply(built, nrow, integer(1))
+  curve <- built[[which.max(n_pts)]] |>
+    dplyr::filter(is.finite(x), is.finite(y)) |>
+    dplyr::group_by(x) |>
+    dplyr::summarise(y = mean(y), .groups = "drop") |>
+    dplyr::arrange(x)
+
+  i_max     <- which.max(curve$y)
+  Pmax_obs  <- curve$y[i_max]
+  I_at_Pmax <- curve$x[i_max]
+
+  # Initial slope: linear fit over the lowest low_frac of the irradiance range (I >= 0).
+  pos <- curve |> dplyr::filter(x >= 0)
+  low <- pos |> dplyr::filter(x <= min(x) + low_frac * diff(range(x)))
+  alpha_obs <- if (nrow(low) >= 3) unname(coef(lm(y ~ x, data = low))[2]) else NA_real_
+
+  # Photoinhibition: slope of the curve beyond the peak (positive = decline).
+  post <- curve[i_max:nrow(curve), ]
+  beta_obs <- if (nrow(post) >= 3 && diff(range(post$x)) > 0) {
+    -unname(coef(lm(y ~ x, data = post))[2])
+  } else NA_real_
+
+  tibble(
+    Pmax_obs  = Pmax_obs,
+    I_at_Pmax = I_at_Pmax,
+    alpha_obs = alpha_obs,
+    beta_obs  = beta_obs,
+    Ik_obs    = Pmax_obs / alpha_obs
+  )
+}
+
+# Process one population and save all cruise pages in one PDF.
+plot_population_pdf <- function(pop_data, curr_pop) {
+
+  fit_par_list <- list()
+  cruise_plot_list <- list()
+
+  # Calculate limits using all cruises for this population.
+  I_values <- pop_data$I[is.finite(pop_data$I)]
+  P_values <- pop_data$P[is.finite(pop_data$P)]
+
+  if (length(I_values) == 0 || length(P_values) == 0) {
+    stop("No finite I or P values for population: ", curr_pop)
+  }
+
+  # Include zero and retain negative values if present.
+  x_range <- range(c(0, I_values))
+  y_range <- range(c(0, P_values))
+
+  # Add a little headroom; handle an all-zero range.
+  x_span <- diff(x_range)
+  y_span <- diff(y_range)
+
+  x_limits <- c(
+    -100,
+    x_range[2] + if (x_span > 0) 0.05 * x_span else 1
+  )
+
+  y_limits <- c(
+    -0.01,
+    y_range[2] + if (y_span > 0) 0.10 * y_span else 0.01
+  )
+
+  # Determine a common page size for this population's PDF.
+  # Each cruise will occupy exactly one page.
+  panel_counts <- pop_data |>
+    distinct(cruise, cruise_day, index_id) |>
+    count(cruise, name = "n_panels")
+
+  max_panels <- max(panel_counts$n_panels)
+  max_rows <- ceiling(max_panels / ncols)
+  # Make population name safe for file names.
+  pop_file_name <- gsub(
+      pattern = "[^A-Za-z0-9_-]",
+      replacement = "_",
+      x = as.character(curr_pop)
+    )
+    # set file name
+  pdf_file <- paste0(
+      pop_file_name,
+      "_",
+      "weight",
+      weight,
+      ".pdf"
+    )
+  output_file <- file.path(
+    output_dir,
+    paste0("PI_curves_", pdf_file)
+  )
+
+  grDevices::pdf(
+    file = output_file,
+    width = 4 * ncols,
+    height = max(6, 3 * max_rows + 1.5),
+    onefile = TRUE
+  )
+
+  # Ensure the PDF closes even if an unexpected error occurs.
+  on.exit(grDevices::dev.off(), add = TRUE)
+
+  cruise_ids <- sort(unique(pop_data$cruise))
+
+  for (curr_cruise in cruise_ids) {
+
+    message(
+      "Processing population: ", curr_pop,
+      " | Cruise: ", curr_cruise
+    )
+
+    # Create one group per daily PI curve.
+    # Group keys determine panel order: cruise_day, then index_id.
+    df_sub <- pop_data |>
+      filter(cruise == curr_cruise) |>
+      group_by(cruise_day, index_id) |>
+      group_split(.keep = TRUE)
+
+    daily_plot_list <- list()
+
+    for (i in seq_along(df_sub)) {
+
+      df <- df_sub[[i]] |>
+        arrange(hour)
+
+      index_id_i <- df$index_id[1]
+      cruise_day_i <- df$cruise_day[1]
+
+      # Retain your original minimum-row requirement.
+      if (nrow(df) <= 4) {
+        message(
+          "Skipping curve ", index_id_i,
+          ": fewer than 5 rows"
+        )
+        next
+      }
+
+      result <- tryCatch({
+
+        # Upweight low-light observations.
+        df_weighted <- upweight_low_light(
+          df,
+          irradiance_col = "I",
+          low_I_min = 0,
+          low_I_max = 250,
+          low_I_weight = weight
+        )
+
+        # Retain your current model-fitting settings.
+        fit <- Fit_piModel(
+          data = df_weighted,
+          DarkReactionRate_R = TRUE,
+          Control = list(maxit = 5000)
+        )
+
+        # Create the individual daily panel.
+        p <- Plot_piCurve(
+          fit,
+          df_weighted,
+          length_out = 200,
+          n_cores = 1
+        ) +
+          labs(
+            title = paste("Day:", cruise_day_i),
+            subtitle = as.character(index_id_i),
+            y = expression("Growth Rate" ~ (hour^{-1}))
+          ) +
+          coord_cartesian(
+            xlim = x_limits,
+            ylim = y_limits,
+            expand = FALSE
+          ) +
+          theme(
+            plot.title = element_text(size = 12, face = "bold"),
+            plot.subtitle = element_text(size = 9),
+            axis.text = element_text(size = 9),
+            axis.title = element_text(size = 10)
+          )
+
+        # Build the parameter row only after fit and plot succeed.
+        # Fitted (model) parameters plus realized (observed) parameters.
+        obs_pars <- extract_observed_pars(p)
+
+        all_fit <- as.list(fit$par)
+        names(all_fit) <- paste0("par_", names(all_fit))
+
+        fit_pars <- bind_cols(
+          tibble(
+            index_id   = index_id_i,
+            cruise     = curr_cruise,
+            cruise_day = cruise_day_i,
+            pop        = curr_pop,
+            n_obs      = nrow(df),
+            Pmax_fit   = unname(fit$par["Pmax"]),
+            alpha_fit  = unname(fit$par["alpha"]),
+            beta_fit   = unname(fit$par["beta"])
+          ),
+          obs_pars,
+          as_tibble(all_fit)
+        )
+
+        list(plot = p, parameters = fit_pars)
+
+      }, error = function(e) {
+
+        message(
+          "Skipping curve ", index_id_i,
+          ": ", conditionMessage(e)
+        )
+
+        NULL
+      })
+
+      if (is.null(result)) {
+        next
+      }
+
+      daily_plot_list[[length(daily_plot_list) + 1]] <- result$plot
+
+      fit_par_list[[length(fit_par_list) + 1]] <-
+        result$parameters
+    }
+
+    # Build one combined plot for this cruise.
+    if (length(daily_plot_list) > 0) {
+
+      cruise_plot <- (
+        wrap_plots(
+          daily_plot_list,
+          ncol = ncols,
+          guides = "collect"
+        ) +
+          plot_annotation(
+            title = paste(
+              "Cruise:", curr_cruise,
+              "| Population:", curr_pop
+            ),
+            subtitle = paste(
+              "Low-light weight:", weight,
+              "| Panels ordered by cruise day"
+            ),
+            theme = theme(
+              plot.title = element_text(size = 18, face = "bold"),
+              plot.subtitle = element_text(size = 11)
+            )
+          )
+      ) &
+        theme(legend.position = "bottom")
+
+    } else {
+
+      # Preserve one page per cruise even if all fits fail.
+      cruise_plot <- ggplot() +
+        annotate(
+          "text",
+          x = 0,
+          y = 0,
+          label = "No successful PI curve fits",
+          size = 6
+        ) +
+        labs(
+          title = paste(
+            "Cruise:", curr_cruise,
+            "| Population:", curr_pop
+          )
+        ) +
+        theme_void()
+    }
+    # store each cruise plot 
+    cruise_plot_list[[as.character(curr_cruise)]] <- cruise_plot
+  }
+
+  # # This runs AFTER the cruise loop has finished.
+  # write_population_pdf(
+  #   plots = cruise_plot_list,
+  #   filename = output_file,
+  #   width = 4 * ncols,
+  #   height = max(6, 3 * max_rows + 1.5)
+  # )
+
+  message("Finished PDF: ", output_file)
+
+  bind_rows(fit_par_list)
+}
+
+# Run once per population.
+fit_par_list <- list()
+
+populations <- sort(unique(test_diel$pop))
+
+for (curr_pop in populations) {
+
+  pop_df <- test_diel |>
+    filter(pop == curr_pop)
+
+  fit_par_list[[as.character(curr_pop)]] <-
+    plot_population_pdf(
+      pop_data = pop_df,
+      curr_pop = curr_pop
+    )
+}
+
+
+
+# Combine successful parameter results from all populations and cruises.
+fit_par_df <- bind_rows(fit_par_list)
+```
+
+## Plot distributions of fit PI parameters
+```{r}
+library(tidyr)
+
+# calcualte Ek
+fit_par_df$Ek_fit <- fit_par_df$Pmax_fit / fit_par_df$alpha_fit
+
+# convert from wide to long 
+fit_par_long <- fit_par_df %>%
+  pivot_longer(
+    cols = c(Pmax_fit, alpha_fit, Ek_fit, beta_fit),
+    names_to = "parameter",
+    values_to = "estimate"
+  ) %>%
+  filter(is.finite(estimate)) %>%
+  mutate(
+    time_res = factor(
+      time_res,
+      levels = c("3min", "15min", "30min", "1H")
+    ),
+    parameter = factor(
+      parameter,
+      levels = c("Pmax_fit", "alpha_fit", "Ek_fit", "beta_fit")
+    )
+  )
+# log normalize
+fit_par_log_long <- fit_par_long %>%
+  filter(
+    parameter %in% c("Pmax_fit", "alpha_fit", "Ek_fit", "beta_fit"),
+    estimate > 0
+  ) %>%
+  mutate(
+    log_estimate = log(estimate)
+  )
+# save as CSV file
+# write.csv(fit_par_all, "../data/diel_pi_fits_wide.csv", row.names = FALSE)
+# write.csv(fit_par_log_long, "../data/diel_pi_fits.csv", row.names = FALSE)
+
+ggplot(fit_par_log_long, aes(x = log_estimate)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 30,
+    fill = "grey75",
+    color = "white",
+    linewidth = 0.3
+  ) +
+  geom_density(
+    fill = "#2C7FB8",
+    color = "#08519C",
+    alpha = 0.30,
+    linewidth = 0.8,
+    adjust = 1
+  ) +
+  facet_grid(
+    pop ~ parameter,
+    scales = "free_x"
+  ) +
+  labs(
+    title = "P–I parameter distributions across Populations",
+    x = "Fitted parameter estimate",
+    y = "Density"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_rect(fill = "grey92", color = NA),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.spacing = grid::unit(0.9, "lines")
+  )
+```
+
+# Plot distributions of observed PI parameters
+
+```{r}
+library(tidyr)
+
+# Calculate Ek from the observed parameters
+fit_par_df$Ek_obs <- fit_par_df$Pmax_obs / fit_par_df$alpha_obs
+
+# Convert observed parameters from wide to long
+fit_par_long <- fit_par_df %>%
+  select(-any_of(c("Pmax_fit", "alpha_fit", "beta_fit", "Ek_fit"))) %>%  # avoid name clashes with fitted columns
+  rename(
+    Pmax  = Pmax_obs,
+    alpha = alpha_obs,
+    beta  = beta_obs,
+  ) %>%
+  pivot_longer(
+    cols = c(Pmax, alpha, Ek_obs, beta),
+    names_to = "parameter",
+    values_to = "estimate"
+  ) %>%
+  filter(is.finite(estimate)) %>%
+  mutate(
+    time_res = factor(
+      time_res,
+      levels = c("3min", "15min", "30min", "1H")
+    ),
+    parameter = factor(
+      parameter,
+      levels = c("Pmax", "alpha", "beta", "Ek_obs")
+    )
+  )
+
+# Log-transform (only positive values can be logged)
+fit_par_log_long <- fit_par_long %>%
+  filter(estimate > 0) %>%
+  mutate(log_estimate = log(estimate))
+
+# Save as CSV files
+# write.csv(fit_par_df, "../data/diel_pi_fits_obs_wide.csv", row.names = FALSE)
+# write.csv(fit_par_log_long, "../data/diel_pi_fits_obs.csv", row.names = FALSE)
+```
+
+```{r}
+# Calculate the mean of the log-transformed estimates in each facet
+facet_means <- fit_par_log_long %>%
+  group_by(pop, parameter) %>%
+  summarise(
+    mean_log_estimate = mean(log_estimate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(fit_par_log_long, aes(x = log_estimate)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 30,
+    fill = "grey75",
+    color = "white",
+    linewidth = 0.3
+  ) +
+  geom_density(
+    fill = "#2C7FB8",
+    color = "#08519C",
+    alpha = 0.30,
+    linewidth = 0.8,
+    adjust = 1
+  ) +
+  facet_grid(
+    pop ~ parameter,
+    scales = "free_x"
+  ) +
+  ggh4x::facetted_pos_scales(
+    x = list(
+      parameter == "beta" ~ scale_x_continuous(
+        limits = c(-15, -5)  # Example upper limit; replace as needed
+      )
+    )
+  ) +
+  labs(
+    title = "Observed P–I parameter distributions across Populations",
+    x = "Log (parameter estimate)",
+    y = "Density"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_rect(fill = "grey92", color = NA),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.spacing = grid::unit(0.9, "lines")
+  )
+```
+
+
+```{r}
+ggplot(fit_par_log_long, aes(x = log_estimate)) +
+  geom_histogram(
+    aes(
+      y = after_stat(density),
+      fill = pop
+    ),
+    bins = 30,
+    color = "white",
+    linewidth = 0.3,
+    position = "identity",
+    alpha = 0.45
+  ) +
+  geom_density(
+    aes(
+      color = pop,
+      fill = pop
+    ),
+    alpha = 0.18,
+    linewidth = 0.9,
+    adjust = 1
+  ) +
+  facet_grid(
+     ~ parameter,
+    scales = "free_x"
+  ) +
+  ggh4x::facetted_pos_scales(
+    x = list(
+      parameter == "beta" ~ scale_x_continuous(
+        limits = c(-15, -5)  # Example upper limit; replace as needed
+      )
+    )
+  ) +
+  scale_fill_viridis_d(
+    option = "D",
+    end = 0.85,
+    name = "Population"
+  ) +
+  scale_color_viridis_d(
+    option = "D",
+    end = 0.85,
+    name = "Population"
+  ) +
+  labs(
+    title = "PI distributions",
+    x = expression("Log-Normalized Parameter"),
+    y = "Density"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_rect(fill = "grey92", color = NA),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    panel.spacing = grid::unit(0.9, "lines"),
+    legend.position = "bottom"
+  )
+```
+
+
+```{r}
+# save data
+write.csv(fit_par_df, "../data/all_pops_diel_pi_30min.csv", row.names = FALSE)
+```
+
+
+
+### Now let's try the new model (Code from Mohammad)
+```{r}
+# functions
+fit_2tanh_model <- function(x) {
+  fit_noDR <- Fit_piModel(data = x, Control = list(maxit = 5000))
+  
+  fit <- Fit_piModel(
+    data = x,
+    DarkReactionRate_R = T,
+    Control = list(maxit = 5000)
+  )
+  
+  
+  tidy_output <-
+    function(model, data = x) {
+      params <- model$par
+      mse <- model$value
+      sqa <- model$SQA
+      
+      c(index_id = unique(x$index_id),
+        params,
+        mse = mse,
+        sqa)
+    }
+  
+  if (fit_noDR$SQA["R2"] >= fit$SQA["R2adj"]) {
+    tidy_output(model = fit_noDR)
+  } else{
+    tidy_output(model = fit)
+  }
+}
+```
+
+
+```{r}
+# add data type col to the data
+df1 <- 
+  df_label |>
+  right_join(df_renamed, by = "index_id")
+
+df_notLM <- 
+  df1 |> filter(data_type != "lm")
+
+df_subD <- 
+  df_notLM |>
+  group_by(index_id) |>
+  group_split()
+
+# fit model
+fit_piM <-
+  mclapply(df_subD, function(x_data)fit_2tanh_model(x =  x_data), mc.cores = 13) #|>
+  # bind_rows() |>
+  # mutate(
+  #   across(-index_id, ~as.numeric(.x)),
+  #   beta = ifelse(is.na(beta), 0, beta),
+  #   R = ifelse(is.na(R), 0, R)
+  #   )
+
+# head(fit_piM, 2) |>
+#   mutate(across(-index_id, ~round(.x, 2)))
 ```
 
 

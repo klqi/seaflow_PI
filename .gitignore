@@ -3,3 +3,5 @@ data/*
 figures/*
 mohammad/*
 PSM_spectral_PP_model/
+.Rhistory
+__pycache__
